@@ -30,6 +30,7 @@ Beam::Beam(){
       beam_write_slices_inc=1;
 #ifdef GENESIS_USE_AMREX
       beamSoA = new Genesis4BeamSoA();
+      useCudaSolver_ = false;
 #endif
 }
 
@@ -114,6 +115,26 @@ void Beam::track(double delz,vector<Field *> *field, Undulator *und){
     ifld->setStepsize(delz);
   }
 
+#ifdef GENESIS_USE_AMREX
+  if (useCudaSolver_) {
+    if (beamSoA == nullptr || !beamSoA->initialized) {
+      pack_beam_to_soa();
+    }
+
+    cuda_solver.track(delz*0.5,this,und,false);   // track transverse coordinates first half of integration step
+
+    cuda_solver.advance(delz,this,field,und);     // advance longitudinal variables 
+
+    incoherent.apply(this,und,delz);         // apply effect of incoherent synchrotron
+    col.apply(this,und,delz);         // apply effect of collective effects
+
+    cuda_solver.applyR56(this,und,reflength);    // apply the longitudinal phase shift due to R56 if a chicane is selected.
+
+    cuda_solver.track(delz*0.5,this,und,true);
+    return;
+  }
+#endif
+
   solver.track(delz*0.5,this,und,false);   // track transverse coordinates first half of integration step
 
   solver.advance(delz,this,field,und);     // advance longitudinal variables 
@@ -123,7 +144,13 @@ void Beam::track(double delz,vector<Field *> *field, Undulator *und){
 
   solver.applyR56(this,und,reflength);    // apply the longitudinal phase shift due to R56 if a chicane is selected.
 
-  solver.track(delz*0.5,this,und,true);      }
+  solver.track(delz*0.5,this,und,true);
+#ifdef GENESIS_USE_AMREX
+  if (beamSoA != nullptr && beamSoA->initialized) {
+    pack_beam_to_soa();
+  }
+#endif
+}
 
 
 
@@ -367,7 +394,7 @@ void Beam::init_beamSoA()
 
 void Beam::pack_beam_to_soa()
 {
-cout<<"pack_beam_to_soa"<<endl;
+// cout<<"pack_beam_to_soa"<<endl;
     amrex::Gpu::streamSynchronize();
 
     if (!beamSoA->initialized) {
@@ -438,7 +465,7 @@ cout<<"pack_beam_to_soa"<<endl;
 
 void Beam::unpack_soa_to_beam()
 {
-cout<<"unpack_soa_to_beam"<<endl;
+// cout<<"unpack_soa_to_beam"<<endl;
     if (!beamSoA->initialized) {
         return;
     }

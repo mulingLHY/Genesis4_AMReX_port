@@ -14,8 +14,15 @@ cmake -S . -B build -DAMReX_GPU_BACKEND=CUDA -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 8
 ```
 
+
+### `&track/use_cuda`
+`use_cuda` 控制本 port 中独立拆分出的 CUDA 路径，默认为true：
+- `use_cuda = false`：FieldSolver、BeamSolver、TrackBeam、Control::applySlippage、Diagnostic::calc 使用 Genesis4 上游 CPU 实现。
+- `use_cuda = true`：FieldSolver 使用 `FieldSolverADICUDA`/`FieldSolverFFTCUDA`，BeamSolver 使用 `BeamSolverCUDA`，束流 transverse/R56 路径使用 `TrackBeamCUDA`，slippage 使用 `ControlCUDA`，内置诊断计算使用 `DiagnosticCUDA`。
+
+
 ### test
-小的计算case，用于测试运行结果一致性。需要另外编译同版本的Genesis-1.3-Version4的CPU版本。
+小的计算case，用于测试运行结果一致性。
 
 ### VSCode解决代码提示intellisense报错
 如果你用 CMake，重新配置时生成 compile_commands.json
@@ -23,7 +30,8 @@ cmake --build build -j 8
 ```bash
 cmake -S . -B build \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-  -DAMReX_GPU_BACKEND=CUDA
+  -DAMReX_GPU_BACKEND=CUDA \
+  -DCMAKE_BUILD_TYPE=Release
 ```
 然后在 .vscode/settings.json 里加：
 ```json

@@ -1,35 +1,24 @@
-//
-// Created by reiche on 06.01.22.
-// AMReX/SoA diagnostics port.
-//
+#include "DiagnosticCUDA.h"
+
+#ifdef GENESIS_USE_AMREX
+
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <cstdio>
-#include <fstream>
-#include <iostream>
 #include <map>
-#include <limits>
-#include <sstream>
 #include <vector>
 
 #include <mpi.h>
 
-#include "Diagnostic.h"
-#include "Output.h"
-#include "Setup.h"
 #include "Beam.h"
 #include "Field.h"
-#include "Undulator.h"
+#include "Genesis4BeamSoA.h"
+#include "Genesis4FieldSoA.h"
 
-#ifdef GENESIS_USE_AMREX
 #include <AMReX_Gpu.H>
 #include <AMReX_GpuContainers.H>
 #ifdef AMREX_USE_CUDA
 #include <cuda_runtime.h>
-#endif
-#include "Genesis4BeamSoA.h"
-#include "Genesis4FieldSoA.h"
 #endif
 
 using namespace std;
@@ -382,253 +371,53 @@ __global__ void g4_field_slice_reduce_kernel(int nslice,
 
 } // namespace
 
-Diagnostic::Diagnostic()
+DiagnosticCUDA::DiagnosticCUDA()
+  : iz_(0), scratch_(new DiagnosticAMReXScratch())
 {
-  MPI_Comm_rank(MPI_COMM_WORLD, &my_rank_);
-#ifdef GENESIS_USE_AMREX
-  amrex_scratch_.reset(new DiagnosticAMReXScratch());
-#endif
 }
 
-Diagnostic::~Diagnostic()
-{
-#ifdef FFTW
-  for (auto &d: dfield) {
-    if (auto *std_field = dynamic_cast<DiagField *>(d)) {
-      std_field->cleanup_FFT_resources();
-    }
-  }
-#endif
-  for(auto &d: dfield) { delete d; }
-  for(auto &d: dbeam) { delete d; }
-}
+DiagnosticCUDA::~DiagnosticCUDA() = default;
 
-bool Diagnostic::add_beam_diag(DiagBeamBase *pd)
+void DiagnosticCUDA::init(FilterDiagnostics &filter)
 {
-  if(!diag_can_add) { return false; }
-  dbeam.push_back(pd);
-  return true;
-}
-
-bool Diagnostic::add_field_diag(DiagFieldBase *pd)
-{
-  if(!diag_can_add) { return false; }
-  dfield.push_back(pd);
-  return true;
-}
-
-void Diagnostic::init(int rank, int size, int nz_in, int ns_in, int nfld,
-                      bool isTime, bool isScan, FilterDiagnostics &filter)
-{
-  diag_can_add = false;
-#ifdef GENESIS_USE_AMREX
   filter_ = filter;
-#endif
-  nz = nz_in;
-  ns = ns_in;
-  time = isTime;
-  scan = isScan;
-  noff = rank * ns;
-  ntotal = ns * size;
-
-  val.clear();
-  units.clear();
-  single.clear();
-  val.resize(3 + nfld);
-  units.resize(3 + nfld);
-  single.resize(3 + nfld);
-  zout.resize(nz);
-
-  for (auto group : dbeam) {
-    for (auto const &tag : group->getTags(filter)) {
-      units.at(2)[tag.first] = tag.second.units;
-      single.at(2)[tag.first] = tag.second.global;
-      int asize = ns * nz;
-      if (tag.second.once) { asize /= nz; }
-      if (tag.second.global) { asize /= ns; }
-      val.at(2)[tag.first].resize(asize);
-    }
-  }
-
-  for (int ifld = 0; ifld < nfld; ++ifld) {
-    for (auto group : dfield) {
-      for (auto const &tag : group->getTags(filter)) {
-        if (units.at(3+ifld).find(tag.first) != units.at(3+ifld).end()) {
-          if (my_rank_ == 0) {
-            cout << "Diagnostic::init: warning: key " << tag.first
-                 << " already existing in map (possible reason: multiple plugins with same obj_prefix)" << endl;
-          }
-        }
-        units.at(3+ifld)[tag.first] = tag.second.units;
-        single.at(3+ifld)[tag.first] = tag.second.global;
-        int asize = ns * nz;
-        if (tag.second.once) { asize /= nz; }
-        if (tag.second.global) { asize /= ns; }
-        val.at(3+ifld)[tag.first].resize(asize);
-      }
-    }
-  }
-  iz = 0;
+  iz_ = 0;
 }
 
-void Diagnostic::addOutput(int groupID, string key, string unit, vector<double> &data)
+bool DiagnosticCUDA::calc(Beam *beam, std::vector<Field *> *field, double z, Diagnostic &diag)
 {
-  val.at(groupID)[key] = data;
-  units.at(groupID)[key] = unit;
-  single.at(groupID)[key] = true;
-}
-
-bool Diagnostic::writeToOutputFile(Beam *beam, vector<Field *> *field, Setup *setup, Undulator *und)
-{
-  diag_can_add = false;
-
-  string rn, fnout;
-  setup->getRootName(&rn);
-  setup->RootName_to_FileName(&fnout, &rn);
-  fnout.append(".out.h5");
-
-  string fnmeta;
-  setup->RootName_to_FileName(&fnmeta, &rn);
-  fnmeta.append(".meta.h5");
-
-  this->addOutput(0,"zplot","m", zout);
-  this->addOutput(0,"z","m", und->z);
-  this->addOutput(0,"dz","m", und->dz);
-  this->addOutput(0,"aw"," ", und->aw);
-  this->addOutput(0,"ax","m", und->ax);
-  this->addOutput(0,"ay","m", und->ay);
-  this->addOutput(0,"ku","m^{-1}", und->ku);
-  this->addOutput(0,"kx"," ", und->kx);
-  this->addOutput(0,"ky"," ", und->ky);
-  this->addOutput(0,"qf","m^{-2}", und->qf);
-  this->addOutput(0,"qx","m", und->qx);
-  this->addOutput(0,"qy","m", und->qy);
-  this->addOutput(0,"cx","rad", und->cx);
-  this->addOutput(0,"cy","rad", und->cy);
-  this->addOutput(0,"gradx","m^{-1}", und->gradx);
-  this->addOutput(0,"grady","m^{-1}", und->grady);
-  this->addOutput(0,"slippage"," ", und->slip);
-  this->addOutput(0,"phaseshift","rad", und->phaseshift);
-  this->addOutput(0,"chic_angle","degree", und->chic_angle);
-  this->addOutput(0,"chic_lb","m", und->chic_lb);
-  this->addOutput(0,"chic_ld","m", und->chic_ld);
-  this->addOutput(0,"chic_lt","m", und->chic_lt);
-
-  vector<double> global(1);
-  global[0] = und->getGammaRef();
-  this->addOutput(1,"gamma0","mc^2",global);
-  global[0] = beam->reflength;
-  this->addOutput(1,"lambdaref","m",global);
-  global[0] = beam->slicelength / beam->reflength;
-  this->addOutput(1,"sample"," ",global);
-  global[0] = beam->slicelength * ntotal;
-  this->addOutput(1,"slen","m",global);
-  global[0] = beam->one4one ? 1.0 : 0.0;
-  this->addOutput(1,"one4one"," ",global);
-  global[0] = time ? 1.0 : 0.0;
-  this->addOutput(1,"time"," ",global);
-  global[0] = scan ? 1.0 : 0.0;
-  this->addOutput(1,"scan"," ",global);
-
-  global.resize(ntotal);
-  for (int i = 0; i < ntotal; i++) {
-    global[i] = static_cast<double>(i) * beam->slicelength;
+  if (beam == nullptr || beam->beamSoA == nullptr || !beam->beamSoA->initialized) {
+    return false;
   }
-  this->addOutput(1,"s","m",global);
-
-  const double e0 = 1239.842e-9 / beam->reflength;
-  double df = e0 * beam->reflength / beam->slicelength / static_cast<double>(ntotal);
-  if (ntotal == 1) { df = 0.0; }
-  for (int i = 0; i < ntotal; i++) {
-    global[i] = static_cast<double>(i) * df - 0.5 * df * static_cast<double>(ntotal);
+  if (field == nullptr) {
+    return false;
   }
-  this->addOutput(1,"frequency","eV",global);
-
-  if(setup->get_do_write_outfile()) {
-    Output out;
-    if(!out.open(fnout, noff, ns)) {
-      if(my_rank_==0) { cout << " unable to open output file" << endl; }
+  for (auto *fld : *field) {
+    if (fld == nullptr || fld->fieldSoA == nullptr || !fld->fieldSoA->initialized) {
       return false;
     }
-    out.writeMeta(und);
-    out.writeGroup("Lattice", val[0], units[0], single[0]);
-    out.writeGroup("Global", val[1], units[1], single[1]);
-    out.writeGroup("Beam", val[2], units[2], single[2]);
-    for (int i = 3; i < static_cast<int>(val.size()); i++) {
-      const int h = field->at(i-3)->harm;
-      char objname[30] = "Field";
-      if (h != 1) { snprintf(objname, sizeof(objname), "Field%d", h); }
-      out.writeGroup(objname, val[i], units[i], single[i]);
-    }
-    out.close();
-  } else {
-    if(my_rank_==0) {
-      stringstream ss;
-      ofstream ofs;
-      ss << fnout << ".suppressed";
-      ofs.open(ss.str(), ofstream::out);
-      ofs.close();
-      cout << " INFO: debug option to suppress writing of .out.h5 file is set" << endl;
-    }
   }
 
-  if(setup->get_write_meta_file()) {
-    Output out_meta;
-    if(!out_meta.open(fnmeta, noff, ns)) {
-      if(my_rank_==0) { cout << " unable to open output file" << endl; }
-      return false;
-    }
-    out_meta.writeMeta(und);
-    out_meta.close();
+  if (iz_ < static_cast<int>(diag.zout.size())) {
+    diag.zout[iz_] = z;
   }
-  return true;
-}
 
-void Diagnostic::calc(Beam* beam, vector<Field *> *field, double z)
-{
-  diag_can_add = false;
-  zout[iz] = z;
-
-#ifdef GENESIS_USE_AMREX
-  if (calc_builtin_amrex(beam, field, z)) {
-    iz++;
-    return;
+  if (diag.val.size() > 2) {
+    calcBeam(beam, diag.val[2]);
   }
-#endif
-
-  for (auto group: dbeam) {
-    group->getValues(beam, val[2], iz);
-  }
-  for (int ifld = 0; ifld < static_cast<int>(field->size()); ifld++) {
-    for (auto group: dfield) {
-      group->getValues(field->at(ifld), val[3+ifld], iz);
-    }
-  }
-  iz++;
-}
-
-#ifdef GENESIS_USE_AMREX
-bool Diagnostic::calc_builtin_amrex(Beam *beam, vector<Field *> *field, double)
-{
-#ifdef FFTW
-  if (filter_.field.fft) {
-    amrex::Abort("GPU diagnostic path does not support FFT diagnostic yet");
-  }
-#endif
-
-  // Fast GPU builtin path.  The AMReX port treats SoA as the source of truth;
-  // callers are responsible for providing initialized, current BeamSoA/FieldSoA.
-  // Do not silently unpack to the legacy AoS path here: that destroys GPU
-  // residency and made auxiliary diagnostics dominate runtime.
-  calc_builtin_beam_amrex(beam);
 
   for (int ifld = 0; ifld < static_cast<int>(field->size()); ++ifld) {
-    calc_builtin_field_amrex(field->at(ifld), 3 + ifld);
+    const int groupID = 3 + ifld;
+    if (groupID < static_cast<int>(diag.val.size())) {
+      calcField(field->at(ifld), diag.val[groupID]);
+    }
   }
+
+  iz_++;
   return true;
 }
 
-bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
+bool DiagnosticCUDA::calcBeam(Beam *beam, std::map<std::string, std::vector<double> > &out)
 {
   Genesis4BeamSoA *soa = beam->beamSoA;
   const int nslice = soa->nslice;
@@ -638,7 +427,7 @@ bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
 
   const std::size_t nstats = static_cast<std::size_t>(nslice) * G4_BEAM_STATS;
   const std::size_t nbunch = static_cast<std::size_t>(nslice) * nharm;
-  auto& scratch = *amrex_scratch_;
+  auto& scratch = *scratch_;
   g4_resize_pair(scratch.beam_stats_dev, scratch.beam_stats_host, nstats);
   g4_resize_pair(scratch.beam_bre_dev, scratch.beam_bre_host, nbunch);
   g4_resize_pair(scratch.beam_bim_dev, scratch.beam_bim_host, nbunch);
@@ -663,8 +452,7 @@ bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
   g4_copy_device_to_host(scratch.beam_bim_dev, scratch.beam_bim_host, nbunch);
   amrex::Gpu::streamSynchronize();
 
-  auto &out = val[2];
-  const double *stats = scratch.beam_stats_host.data();
+    const double *stats = scratch.beam_stats_host.data();
   const double *b_re = scratch.beam_bre_host.data();
   const double *b_im = scratch.beam_bim_host.data();
 
@@ -750,7 +538,7 @@ bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
     const double xpx = s[G4_B_XPX] * norm;
     const double ypy = s[G4_B_YPY] * norm;
 
-    const unsigned long idx = static_cast<unsigned long>(iz * nslice + is);
+    const unsigned long idx = static_cast<unsigned long>(iz_ * nslice + is);
 
     if (filter_.beam.energy) {
       g4_store_ptr(p_energy, idx, g1);
@@ -798,12 +586,12 @@ bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
       g4_store_ptr(p_emax, idx, s[G4_B_GMAX]);
     }
 
-    if (filter_.beam.current || iz == 0) {
+    if (filter_.beam.current || iz_ == 0) {
       const double cur = (is < static_cast<int>(beam->current.size())) ? beam->current[is] : 0.0;
       g4_store_ptr(p_current, idx, cur);
     }
 
-    if (filter_.beam.twiss || iz == 0) {
+    if (filter_.beam.twiss || iz_ == 0) {
       const double ex = sqrt(fabs((x2 - x1 * x1) * (px2 - px1 * px1) - (xpx - x1 * px1) * (xpx - x1 * px1)));
       const double ey = sqrt(fabs((y2 - y1 * y1) * (py2 - py1 * py1) - (ypy - y1 * py1) * (ypy - y1 * py1)));
       g4_store_ptr(p_emitx, idx, ex);
@@ -834,21 +622,21 @@ bool Diagnostic::calc_builtin_beam_amrex(Beam *beam)
     const double norm = (g_cur > 0.0) ? 1.0 / g_cur : 1.0;
     g_g1 *= norm; g_g2 *= norm; g_x1 *= norm; g_x2 *= norm; g_y1 *= norm; g_y2 *= norm;
     if (filter_.beam.energy) {
-      g4_store_ptr(p_global_energy, iz, g_g1);
-      g4_store_ptr(p_global_energyspread, iz, g4_safe_sqrt_var(g_g2 - g_g1 * g_g1));
+      g4_store_ptr(p_global_energy, iz_, g_g1);
+      g4_store_ptr(p_global_energyspread, iz_, g4_safe_sqrt_var(g_g2 - g_g1 * g_g1));
     }
     if (filter_.beam.spatial) {
-      g4_store_ptr(p_global_xposition, iz, g_x1);
-      g4_store_ptr(p_global_xsize, iz, g4_safe_sqrt_var(g_x2 - g_x1 * g_x1));
-      g4_store_ptr(p_global_yposition, iz, g_y1);
-      g4_store_ptr(p_global_ysize, iz, g4_safe_sqrt_var(g_y2 - g_y1 * g_y1));
+      g4_store_ptr(p_global_xposition, iz_, g_x1);
+      g4_store_ptr(p_global_xsize, iz_, g4_safe_sqrt_var(g_x2 - g_x1 * g_x1));
+      g4_store_ptr(p_global_yposition, iz_, g_y1);
+      g4_store_ptr(p_global_ysize, iz_, g4_safe_sqrt_var(g_y2 - g_y1 * g_y1));
     }
   }
 
   return true;
 }
 
-bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
+bool DiagnosticCUDA::calcField(Field *field, std::map<std::string, std::vector<double> > &out)
 {
   Genesis4FieldSoA *soa = field->fieldSoA;
   const int nslice = soa->nslice;
@@ -856,7 +644,7 @@ bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
 
   const std::size_t nstats = static_cast<std::size_t>(nslice) * G4_FIELD_STATS;
   const std::size_t ncenter = static_cast<std::size_t>(nslice);
-  auto& scratch = *amrex_scratch_;
+  auto& scratch = *scratch_;
   g4_resize_pair(scratch.field_stats_dev, scratch.field_stats_host, nstats);
   g4_resize_pair(scratch.field_center_re_dev, scratch.field_center_re_host, ncenter);
   g4_resize_pair(scratch.field_center_im_dev, scratch.field_center_im_host, ncenter);
@@ -876,8 +664,7 @@ bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
   g4_copy_device_to_host(scratch.field_center_im_dev, scratch.field_center_im_host, ncenter);
   amrex::Gpu::streamSynchronize();
 
-  auto &out = val[groupID];
-  const double *stats = scratch.field_stats_host.data();
+    const double *stats = scratch.field_stats_host.data();
   const double *center_re = scratch.field_center_re_host.data();
   const double *center_im = scratch.field_center_im_host.data();
 
@@ -958,7 +745,7 @@ bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
     y2 *= field->dgrid;
     inten *= eev * eev / ks / ks / vacimp;
 
-    const unsigned long idx = static_cast<unsigned long>(iz * nslice + is);
+    const unsigned long idx = static_cast<unsigned long>(iz_ * nslice + is);
     g4_store_ptr(p_power, idx, power);
     if (filter_.field.spatial) {
       g4_store_ptr(p_xposition, idx, x1);
@@ -995,20 +782,20 @@ bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
     g_inten *= avg_norm;
     g_ff *= avg_norm;
 
-    g4_store_ptr(p_global_energy, iz, g_pow * scl * scl / vacimp * field->slicelength / 299792458.0);
+    g4_store_ptr(p_global_energy, iz_, g_pow * scl * scl / vacimp * field->slicelength / 299792458.0);
     if (filter_.field.spatial) {
-      g4_store_ptr(p_global_xposition, iz, g_x1);
-      g4_store_ptr(p_global_xsize, iz, g_x2);
-      g4_store_ptr(p_global_yposition, iz, g_y1);
-      g4_store_ptr(p_global_ysize, iz, g_y2);
+      g4_store_ptr(p_global_xposition, iz_, g_x1);
+      g4_store_ptr(p_global_xsize, iz_, g_x2);
+      g4_store_ptr(p_global_yposition, iz_, g_y1);
+      g4_store_ptr(p_global_ysize, iz_, g_y2);
     }
     if (filter_.field.intensity) {
-      g4_store_ptr(p_global_intensity_nf, iz, g_inten * eev * eev / ks / ks / vacimp);
-      g4_store_ptr(p_global_intensity_ff, iz, g_ff);
+      g4_store_ptr(p_global_intensity_nf, iz_, g_inten * eev * eev / ks / ks / vacimp);
+      g4_store_ptr(p_global_intensity_ff, iz_, g_ff);
     }
   }
 
-  if (iz == 0) {
+  if (iz_ == 0) {
     g4_store_ptr(p_dgrid, 0, field->gridmax);
     g4_store_ptr(p_gridspacing, 0, field->dgrid);
     g4_store_ptr(p_ngrid, 0, static_cast<double>(ngrid));
@@ -1018,425 +805,3 @@ bool Diagnostic::calc_builtin_field_amrex(Field *field, int groupID)
 }
 
 #endif // GENESIS_USE_AMREX
-
-// -----------------------------------------------------------
-// actual implementation of diagnostic calculation - beam
-map<string,OutputInfo> DiagBeam::getTags(FilterDiagnostics &filter_in)
-{
-  tags.clear();
-  filter.clear();
-  nharm = filter_in.beam.harm;
-  exclharm = filter_in.beam.exclharm;
-  global = filter_in.beam.global;
-
-  if (filter_in.beam.energy) {
-    filter["energy"] = true;
-    tags["energy"] = {false, false, "mc^2"};
-    tags["energyspread"] = {false, false, "mc^2"};
-    if (global) {
-      tags["Global/energy"] = {true, false, "mc^2"};
-      tags["Global/energyspread"] = {true, false, "mc^2"};
-    }
-  }
-  if (filter_in.beam.spatial) {
-    filter["spatial"] = true;
-    tags["xposition"] = {false, false, "m"};
-    tags["xsize"] = {false, false, "m"};
-    tags["yposition"] = {false, false, "m"};
-    tags["ysize"] = {false, false, "m"};
-    tags["pxposition"] = {false, false, "rad"};
-    tags["pyposition"] = {false, false, "rad"};
-    if (global) {
-      tags["Global/xposition"] = {true, false, "m"};
-      tags["Global/xsize"] = {true, false, "m"};
-      tags["Global/yposition"] = {true, false, "m"};
-      tags["Global/ysize"] = {true, false, "m"};
-    }
-  }
-
-  tags["bunching"] = {false, false, " "};
-  tags["bunchingphase"] = {false, false, "rad"};
-  char buff[30];
-  if (exclharm && nharm > 1) {
-    snprintf(buff, sizeof(buff), "bunching%d", nharm);
-    tags[buff] = {false, false, " "};
-    snprintf(buff, sizeof(buff), "bunchingphase%d", nharm);
-    tags[buff] = {false, false, "rad"};
-  } else {
-    for (unsigned int iharm = 1; iharm < nharm; iharm++) {
-      snprintf(buff, sizeof(buff), "bunching%d", iharm + 1);
-      tags[buff] = {false, false, " "};
-      snprintf(buff, sizeof(buff), "bunchingphase%d", iharm + 1);
-      tags[buff] = {false, false, "rad"};
-    }
-  }
-
-  if (filter_in.beam.auxiliar) {
-    filter["aux"] = true;
-    tags["efield"] = {false, false, "eV/m"};
-    tags["wakefield"] = {false, false, "eV/m"};
-    tags["LSCfield"] = {false, false, "eV/m"};
-    tags["SSCfield"] = {false, false, "eV/m"};
-    tags["xmin"] = {false, false, "m"};
-    tags["xmax"] = {false, false, "m"};
-    tags["pxmin"] = {false, false, "rad"};
-    tags["pxmax"] = {false, false, "rad"};
-    tags["ymin"] = {false, false, "m"};
-    tags["ymax"] = {false, false, "m"};
-    tags["pymin"] = {false, false, "rad"};
-    tags["pymax"] = {false, false, "rad"};
-    tags["emin"] = {false, false, "mc^2"};
-    tags["emax"] = {false, false, "mc^2"};
-  }
-
-  if (filter_in.beam.current) {
-    tags["current"] = {false, false, "A"};
-  } else {
-    tags["current"] = {false, true, "A"};
-  }
-
-  if (filter_in.beam.twiss) {
-    tags["emitx"] = {false, false, "m"};
-    tags["emity"] = {false, false, "m"};
-    tags["betax"] = {false, false, "m"};
-    tags["betay"] = {false, false, "m"};
-    tags["alphax"] = {false, false, "rad"};
-    tags["alphay"] = {false, false, "rad"};
-  } else {
-    tags["emitx"] = {false, true, "m"};
-    tags["emity"] = {false, true, "m"};
-    tags["betax"] = {false, true, "m"};
-    tags["betay"] = {false, true, "m"};
-    tags["alphax"] = {false, true, "rad"};
-    tags["alphay"] = {false, true, "rad"};
-  }
-  return tags;
-}
-
-void DiagBeam::getValues(Beam *beam, map<string, vector<double> > &val, int iz)
-{
-  const int ns = beam->beam.size();
-  const unsigned int nh = std::max(1u, nharm);
-  int is = 0;
-
-  double g_cur = 0.0, g_g1 = 0.0, g_g2 = 0.0, g_x1 = 0.0, g_x2 = 0.0, g_y1 = 0.0, g_y2 = 0.0;
-
-  for (auto const &slice: beam->beam) {
-    double g1 = 0.0, g2 = 0.0, x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
-    double px1 = 0.0, py1 = 0.0, px2 = 0.0, py2 = 0.0, xpx = 0.0, ypy = 0.0;
-    double xmin = 1e5, xmax = -1e5, pxmin = 1e5, pxmax = -1e5;
-    double ymin = 1e5, ymax = -1e5, pymin = 1e5, pymax = -1e5;
-    double gmin = 1e7, gmax = 1;
-    vector<complex<double> > b(nh, complex<double>(0.0, 0.0));
-
-    for (auto const &par: slice) {
-      x1 += par.x; x2 += par.x * par.x;
-      y1 += par.y; y2 += par.y * par.y;
-      g1 += par.gamma; g2 += par.gamma * par.gamma;
-      px1 += par.px; py1 += par.py;
-      px2 += par.px * par.px; py2 += par.py * par.py;
-      xpx += par.x * par.px; ypy += par.y * par.py;
-      for (unsigned int ih = 0; ih < nh; ++ih) {
-        b[ih] += complex<double>(cos(static_cast<double>(ih + 1) * par.theta),
-                                 sin(static_cast<double>(ih + 1) * par.theta));
-      }
-      xmin = std::min(xmin, par.x); xmax = std::max(xmax, par.x);
-      pxmin = std::min(pxmin, par.px); pxmax = std::max(pxmax, par.px);
-      ymin = std::min(ymin, par.y); ymax = std::max(ymax, par.y);
-      pymin = std::min(pymin, par.py); pymax = std::max(pymax, par.py);
-      gmin = std::min(gmin, par.gamma); gmax = std::max(gmax, par.gamma);
-    }
-
-    const double norm = slice.empty() ? 1.0 : 1.0 / static_cast<double>(slice.size());
-    x1 *= norm; x2 *= norm; y1 *= norm; y2 *= norm;
-    px1 *= norm; px2 *= norm; py1 *= norm; py2 *= norm;
-    g1 *= norm; g2 *= norm; xpx *= norm; ypy *= norm;
-    for (auto &bi: b) { bi *= norm; }
-
-    const unsigned long idx = static_cast<unsigned long>(iz * ns + is);
-    if (filter["energy"]) {
-      storeValue(val, "energy", idx, g1);
-      storeValue(val, "energyspread", idx, sqrt(fabs(g2 - g1 * g1)));
-    }
-    if (filter["spatial"]) {
-      storeValue(val, "xposition", idx, x1);
-      storeValue(val, "xsize", idx, sqrt(fabs(x2 - x1 * x1)));
-      storeValue(val, "yposition", idx, y1);
-      storeValue(val, "ysize", idx, sqrt(fabs(y2 - y1 * y1)));
-      storeValue(val, "pxposition", idx, px1);
-      storeValue(val, "pyposition", idx, py1);
-    }
-    storeValue(val, "bunching", idx, abs(b[0]));
-    storeValue(val, "bunchingphase", idx, atan2(b[0].imag(), b[0].real()));
-    char buff[100];
-    if (exclharm && nh > 1) {
-      snprintf(buff, sizeof(buff), "bunching%d", nh);
-      storeValue(val, buff, idx, abs(b[nh-1]));
-      snprintf(buff, sizeof(buff), "bunchingphase%d", nh);
-      storeValue(val, buff, idx, atan2(b[nh-1].imag(), b[nh-1].real()));
-    } else {
-      for (unsigned int ih = 1; ih < nh; ++ih) {
-        snprintf(buff, sizeof(buff), "bunching%d", ih + 1);
-        storeValue(val, buff, idx, abs(b[ih]));
-        snprintf(buff, sizeof(buff), "bunchingphase%d", ih + 1);
-        storeValue(val, buff, idx, atan2(b[ih].imag(), b[ih].real()));
-      }
-    }
-
-    if (filter["aux"]) {
-      storeValue(val, "efield", idx, beam->eloss[is] + beam->longESC[is]);
-      storeValue(val, "wakefield", idx, beam->eloss[is]);
-      storeValue(val, "LSCfield", idx, beam->longESC[is]);
-      storeValue(val, "SSCfield", idx, beam->getSCField(is));
-      storeValue(val, "xmin", idx, xmin); storeValue(val, "xmax", idx, xmax);
-      storeValue(val, "pxmin", idx, pxmin); storeValue(val, "pxmax", idx, pxmax);
-      storeValue(val, "ymin", idx, ymin); storeValue(val, "ymax", idx, ymax);
-      storeValue(val, "pymin", idx, pymin); storeValue(val, "pymax", idx, pymax);
-      storeValue(val, "emin", idx, gmin); storeValue(val, "emax", idx, gmax);
-    }
-
-    if (tags["current"].once) {
-      if (iz == 0) { storeValue(val, "current", idx, beam->current[is]); }
-    } else {
-      storeValue(val, "current", idx, beam->current[is]);
-    }
-
-    const double ex = sqrt(fabs((x2 - x1 * x1) * (px2 - px1 * px1) - (xpx - x1 * px1) * (xpx - x1 * px1)));
-    const double ey = sqrt(fabs((y2 - y1 * y1) * (py2 - py1 * py1) - (ypy - y1 * py1) * (ypy - y1 * py1)));
-    if (!tags["emitx"].once || iz == 0) {
-      storeValue(val, "emitx", idx, ex); storeValue(val, "emity", idx, ey);
-      storeValue(val, "betax", idx, (ex > 0.0) ? (x2 - x1 * x1) / ex * g1 : 0.0);
-      storeValue(val, "betay", idx, (ey > 0.0) ? (y2 - y1 * y1) / ey * g1 : 0.0);
-      storeValue(val, "alphax", idx, (ex > 0.0) ? -(xpx - x1 * px1) / ex : 0.0);
-      storeValue(val, "alphay", idx, (ey > 0.0) ? -(ypy - y1 * py1) / ey : 0.0);
-    }
-
-    if (global) {
-      g_cur += beam->current[is];
-      g_g1 += beam->current[is] * g1;
-      g_g2 += beam->current[is] * g2;
-      g_x1 += beam->current[is] * x1;
-      g_x2 += beam->current[is] * x2;
-      g_y1 += beam->current[is] * y1;
-      g_y2 += beam->current[is] * y2;
-    }
-    is++;
-  }
-
-  if (global) {
-    double gvals[7] = {g_cur, g_g1, g_g2, g_x1, g_x2, g_y1, g_y2};
-    g4_allreduce_sum_inplace(gvals, 7);
-    g_cur = gvals[0]; g_g1 = gvals[1]; g_g2 = gvals[2];
-    g_x1 = gvals[3]; g_x2 = gvals[4]; g_y1 = gvals[5]; g_y2 = gvals[6];
-    const double norm = (g_cur > 0.0) ? 1.0 / g_cur : 1.0;
-    g_g1 *= norm; g_g2 *= norm; g_x1 *= norm; g_x2 *= norm; g_y1 *= norm; g_y2 *= norm;
-    if (filter["energy"]) {
-      storeValue(val, "Global/energy", iz, g_g1);
-      storeValue(val, "Global/energyspread", iz, sqrt(fabs(g_g2 - g_g1 * g_g1)));
-    }
-    if (filter["spatial"]) {
-      storeValue(val, "Global/xposition", iz, g_x1);
-      storeValue(val, "Global/xsize", iz, sqrt(fabs(g_x2 - g_x1 * g_x1)));
-      storeValue(val, "Global/yposition", iz, g_y1);
-      storeValue(val, "Global/ysize", iz, sqrt(fabs(g_y2 - g_y1 * g_y1)));
-    }
-  }
-}
-
-#ifdef FFTW
-void DiagField::cleanup_FFT_resources(void)
-{
-  for(auto &[k,obj]: fftobj) { delete obj; }
-  fftobj.clear();
-}
-
-int DiagField::obtain_FFT_resources(int ngrid, complex<double> **in, complex<double> **out, fftw_plan *pp)
-{
-  auto ele = fftobj.find(ngrid);
-  if (ele == fftobj.end()) {
-    FFTObj *n = new FFTObj(ngrid);
-    fftobj.insert({ngrid, n});
-    ele = fftobj.find(ngrid);
-  }
-  *in = ele->second->in_;
-  *out = ele->second->out_;
-  *pp = ele->second->p_;
-  return 0;
-}
-#endif
-
-map<string,OutputInfo> DiagField::getTags(FilterDiagnostics &filter_in)
-{
-  tags.clear();
-  filter.clear();
-  global = filter_in.field.global;
-
-  tags["power"] = {false, false, "W"};
-  if (global) { tags["Global/energy"] = {true, false, "J"}; }
-
-  if (filter_in.field.spatial) {
-    filter["spatial"] = true;
-    tags["xposition"] = {false, false, "m"};
-    tags["xsize"] = {false, false, "m"};
-    tags["yposition"] = {false, false, "m"};
-    tags["ysize"] = {false, false, "m"};
-    if (global) {
-      tags["Global/xposition"] = {true, false, "m"};
-      tags["Global/xsize"] = {true, false, "m"};
-      tags["Global/yposition"] = {true, false, "m"};
-      tags["Global/ysize"] = {true, false, "m"};
-    }
-  }
-
-  if (filter_in.field.intensity) {
-    filter["intensity"] = true;
-    tags["intensity-nearfield"] = {false, false, "W/m^2"};
-    tags["phase-nearfield"] = {false, false, "rad"};
-    tags["intensity-farfield"] = {false, false, "W/rad^2"};
-    tags["phase-farfield"] = {false, false, "rad"};
-    if (global) {
-      tags["Global/intensity-nearfield"] = {true, false, "W/m^2"};
-      tags["Global/intensity-farfield"] = {true, false, "W/rad^2"};
-    }
-  }
-
-#ifdef FFTW
-  if (filter_in.field.fft) {
-    filter["fft"] = true;
-    tags["xpointing"] = {false, false, "rad"};
-    tags["xdivergence"] = {false, false, "rad"};
-    tags["ypointing"] = {false, false, "rad"};
-    tags["ydivergence"] = {false, false, "rad"};
-    if (global) {
-      tags["Global/xpointing"] = {true, false, "rad"};
-      tags["Global/xdivergence"] = {true, false, "rad"};
-      tags["Global/ypointing"] = {true, false, "rad"};
-      tags["Global/ydivergence"] = {true, false, "rad"};
-    }
-  }
-#endif
-
-  // some basic parameter output
-  tags["gridspacing"] = {true, true, "m"};
-  tags["dgrid"] = {true, true, "m"};
-  tags["ngrid"] = {true, true, " "};
-
-  return tags;
-}
-
-void DiagField::getValues(Field *field, map<string, vector<double> > &val, int iz)
-{
-  const int ns = field->field.size();
-  const int ngrid = field->ngrid;
-  const double ks = 4.0 * asin(1.0) / field->xlambda;
-  const double scl = field->dgrid * eev / ks;
-  const double shift = -0.5 * static_cast<double>(ngrid - 1);
-
-  double g_pow = 0.0, g_x1 = 0.0, g_x2 = 0.0, g_y1 = 0.0, g_y2 = 0.0;
-  double g_ff = 0.0, g_inten = 0.0;
-
-  int is0 = 0;
-  for (auto const &slice : field->field) {
-    const int is = (ns + is0 - field->first) % ns;
-    double power = 0.0, x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
-    complex<double> ff(0.0, 0.0);
-
-    for (int iy = 0; iy < ngrid; iy++) {
-      const double dy = static_cast<double>(iy) + shift;
-      for (int ix = 0; ix < ngrid; ix++) {
-        const double dx = static_cast<double>(ix) + shift;
-        const int i = iy * ngrid + ix;
-        const complex<double> loc = slice.at(i);
-        const double wei = loc.real() * loc.real() + loc.imag() * loc.imag();
-        ff += loc;
-        power += wei;
-        x1 += dx * wei;
-        x2 += dx * dx * wei;
-        y1 += dy * wei;
-        y2 += dy * dy * wei;
-      }
-    }
-
-    if (global) {
-      g_pow += power;
-      g_x1 += x1;
-      g_x2 += x2;
-      g_y1 += y1;
-      g_y2 += y2;
-    }
-
-    if (power > 0.0) {
-      x1 /= power; x2 /= power; y1 /= power; y2 /= power;
-    }
-    x2 = sqrt(fabs(x2 - x1 * x1));
-    y2 = sqrt(fabs(y2 - y1 * y1));
-
-    const int ic = (ngrid * ngrid - 1) / 2;
-    complex<double> loc = slice.at(ic);
-    double inten = loc.real() * loc.real() + loc.imag() * loc.imag();
-    const double intenphi = atan2(loc.imag(), loc.real());
-    double farfield = ff.real() * ff.real() + ff.imag() * ff.imag();
-    const double farfieldphi = atan2(ff.imag(), ff.real());
-    farfield *= field->dgrid * field->dgrid;
-    if (global) {
-      g_ff += farfield;
-      g_inten += inten;
-    }
-
-    power *= scl * scl / vacimp;
-    x1 *= field->dgrid; x2 *= field->dgrid; y1 *= field->dgrid; y2 *= field->dgrid;
-    inten *= eev * eev / ks / ks / vacimp;
-
-    const unsigned long idx = static_cast<unsigned long>(iz * ns + is);
-    storeValue(val, "power", idx, power);
-    if (filter["spatial"]) {
-      storeValue(val, "xposition", idx, x1);
-      storeValue(val, "xsize", idx, x2);
-      storeValue(val, "yposition", idx, y1);
-      storeValue(val, "ysize", idx, y2);
-    }
-    if (filter["intensity"]) {
-      storeValue(val, "intensity-nearfield", idx, inten);
-      storeValue(val, "phase-nearfield", idx, intenphi);
-      storeValue(val, "intensity-farfield", idx, farfield);
-      storeValue(val, "phase-farfield", idx, farfieldphi);
-    }
-    is0++;
-  }
-
-  if (global) {
-    int size = 1;
-    if (!MPISingle) { MPI_Comm_size(MPI_COMM_WORLD, &size); }
-    double gvals[7] = {g_pow, g_x1, g_x2, g_y1, g_y2, g_ff, g_inten};
-    g4_allreduce_sum_inplace(gvals, 7);
-    g_pow = gvals[0]; g_x1 = gvals[1]; g_x2 = gvals[2];
-    g_y1 = gvals[3]; g_y2 = gvals[4]; g_ff = gvals[5]; g_inten = gvals[6];
-    const double norm = (g_pow > 0.0) ? 1.0 / g_pow : 1.0;
-    g_x1 *= norm; g_x2 *= norm; g_y1 *= norm; g_y2 *= norm;
-    g_x2 = sqrt(fabs(g_x2 - g_x1 * g_x1)) * field->dgrid;
-    g_y2 = sqrt(fabs(g_y2 - g_y1 * g_y1)) * field->dgrid;
-    g_x1 *= field->dgrid;
-    g_y1 *= field->dgrid;
-    const double avg_norm = 1.0 / static_cast<double>(size * ns);
-    g_inten *= avg_norm;
-    g_ff *= avg_norm;
-
-    storeValue(val, "Global/energy", iz, g_pow * scl * scl / vacimp * field->slicelength / 299792458.0);
-    if (filter["spatial"]) {
-      storeValue(val, "Global/xposition", iz, g_x1);
-      storeValue(val, "Global/xsize", iz, g_x2);
-      storeValue(val, "Global/yposition", iz, g_y1);
-      storeValue(val, "Global/ysize", iz, g_y2);
-    }
-    if (filter["intensity"]) {
-      storeValue(val, "Global/intensity-nearfield", iz, g_inten * eev * eev / ks / ks / vacimp);
-      storeValue(val, "Global/intensity-farfield", iz, g_ff);
-    }
-  }
-
-  if (iz == 0) {
-    storeValue(val, "dgrid", 0, field->gridmax);
-    storeValue(val, "gridspacing", 0, field->dgrid);
-    storeValue(val, "ngrid", 0, static_cast<double>(ngrid));
-  }
-}

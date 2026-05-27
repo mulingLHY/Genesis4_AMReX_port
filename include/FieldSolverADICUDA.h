@@ -1,9 +1,6 @@
-#ifndef __GENESIS_FIELDSOLVERADI__
-#define __GENESIS_FIELDSOLVERADI__
+#ifndef __GENESIS_FIELDSOLVERADICUDA__
+#define __GENESIS_FIELDSOLVERADICUDA__
 
-#include <vector>
-#include <iostream>
-#include <string>
 #include <complex>
 
 #ifdef GENESIS_USE_AMREX
@@ -13,15 +10,14 @@
 class Field;
 class Beam;
 
-#include "Particle.h"
 #include "Undulator.h"
 #include "FieldSolver.h"
 
 using namespace std;
 
-class FieldSolverADI : public FieldSolver{
+class FieldSolverADICUDA : public FieldSolver{
  public:
-  ~FieldSolverADI();
+  ~FieldSolverADICUDA();
 
   void init(double,double,double,unsigned int) override;
   void advance(double, Field *, Beam *, Undulator *) override;
@@ -32,16 +28,6 @@ class FieldSolverADI : public FieldSolver{
   double delz_save {0};
   complex<double> cstep;
 
-  // CPU work arrays kept for non-AMReX builds.
-  vector< complex< double > > r,c,cbet,cwet,crsource;
-
-  void advance_cpu(double, Field *, Beam *, Undulator *);
-  void ADI(vector<complex< double > > &);
-  void tridagx(vector<complex< double > > &);
-  void tridagy(vector<complex< double > > &);
-
-#ifdef GENESIS_USE_AMREX
-  void advance_gpu(double, Field *, Beam *, Undulator *);
 
   // GPU coefficient/work arrays.  Complex numbers are stored as split real/imag
   // arrays so device kernels do not depend on std::complex device support.
@@ -62,8 +48,9 @@ class FieldSolverADI : public FieldSolver{
   // each ADI half-step to avoid holding a second full-grid source array.
   amrex::Gpu::DeviceVector<double> d_r_re, d_r_im;
 
-  // Source scale per beam slice.
-  amrex::Gpu::ManagedVector<double> d_slice_scl;
+  // Source current and scale per beam slice.
+  amrex::Gpu::DeviceVector<double> d_current;
+  amrex::Gpu::DeviceVector<double> d_slice_scl;
 
   // Sort/reduce source construction scratch.  This is solver-owned to avoid
   // cross-field aliasing from function-local static device buffers.
@@ -79,9 +66,8 @@ class FieldSolverADI : public FieldSolver{
   int d_source_contrib_capacity {0};
   int d_pcr_factor_ngrid {0};
   int d_pcr_num_stages {0};
-#endif
 };
 
-inline void FieldSolverADI::initSourceFilter(double x,double y,double z ,bool t) { return;}
+inline void FieldSolverADICUDA::initSourceFilter(double, double, double, bool) {}
 
 #endif

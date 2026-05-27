@@ -35,4 +35,5 @@ ey=1.2e-6
 &end
 
 &track
+use_cuda=1
 &end

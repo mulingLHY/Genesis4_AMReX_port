@@ -1,22 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
-project(Genesis4_AMReX LANGUAGES CXX C CUDA)
+project(Genesis4_AMReX LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-# ──────────────────────────────────────────────────────
-# CUDA architecture selection
-# ──────────────────────────────────────────────────────
-set(GENESIS_CUDA_ARCHITECTURES "native" CACHE STRING
-    "CUDA architectures: native, 75 for Quadro RTX 6000, 86 for RTX A4000, 89 for RTX 6000 Ada, 90 for H100")
-
-set(CMAKE_CUDA_ARCHITECTURES "${GENESIS_CUDA_ARCHITECTURES}" CACHE STRING
-    "CUDA architectures for Genesis4_AMReX")
-
-# Keep AMReX in sync with this project. Do not FORCE, so users can override it.
-set(AMReX_CUDA_ARCH "${GENESIS_CUDA_ARCHITECTURES}" CACHE STRING
-    "CUDA architecture for AMReX")
 
 # Developer options
 set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -28,6 +15,7 @@ add_compile_definitions(OMPI_SKIP_MPICXX)
 # ──────────────────────────────────────────────────────
 # External source setup
 # ──────────────────────────────────────────────────────
+option(GENESIS_USE_AMREX "Enable AMReX GPU acceleration" ON)
 option(G4_AUTO_FETCH_DEPS "Automatically clone AMReX and upstream Genesis4 if missing" ON)
 option(G4_RENAME_OVERLAPPED_HEADERS "Rename upstream Genesis4 headers shadowed by this port to *.orig" ON)
 
@@ -41,7 +29,7 @@ set(G4_UPSTREAM_SOURCE_DIR "${CMAKE_SOURCE_DIR}/Genesis-1.3-Version4" CACHE PATH
 
 find_package(Git QUIET)
 
-function(g4_clone_if_missing name repo ref dst required_file)
+function(git_clone_if_missing name repo ref dst required_file)
     if (EXISTS "${dst}/${required_file}")
         message(STATUS "${name}: using existing source at ${dst}")
         return()
@@ -135,7 +123,28 @@ function(g4_clone_if_missing name repo ref dst required_file)
     endif()
 endfunction()
 
-function(g4_preserve_shadowed_genesis_headers overlay_include_dir upstream_include_dir)
+function(g4_restore_shadowed_headers overlay_include_dir upstream_include_dir)
+    if (NOT IS_DIRECTORY "${upstream_include_dir}")
+        message(FATAL_ERROR "Genesis4 include directory not found: ${upstream_include_dir}")
+    endif()
+
+    # If a header was preserved by an older port overlay but that overlay was
+    # later removed, restore the upstream header so this port can fall back to
+    # the unmodified Genesis4 implementation.
+    file(GLOB _preserved_headers CONFIGURE_DEPENDS
+        "${upstream_include_dir}/*.orig"
+    )
+    foreach(_orig_header IN LISTS _preserved_headers)
+        get_filename_component(_orig_name "${_orig_header}" NAME)
+        string(REGEX REPLACE "\.orig$" "" _header_name "${_orig_name}")
+        set(_overlay_header "${overlay_include_dir}/${_header_name}")
+        set(_upstream_header "${upstream_include_dir}/${_header_name}")
+        file(RENAME "${_orig_header}" "${_upstream_header}")
+        message(STATUS "Genesis4 header restored: include/${_header_name}.orig -> include/${_header_name}")
+    endforeach()
+endfunction()
+
+function(g4_preserve_shadowed_headers overlay_include_dir upstream_include_dir)
     if (NOT G4_RENAME_OVERLAPPED_HEADERS)
         return()
     endif()
@@ -147,6 +156,23 @@ function(g4_preserve_shadowed_genesis_headers overlay_include_dir upstream_inclu
     if (NOT IS_DIRECTORY "${upstream_include_dir}")
         message(FATAL_ERROR "Genesis4 include directory not found: ${upstream_include_dir}")
     endif()
+
+    # If a header was preserved by an older port overlay but that overlay was
+    # later removed, restore the upstream header so this port can fall back to
+    # the unmodified Genesis4 implementation.
+    file(GLOB _preserved_headers CONFIGURE_DEPENDS
+        "${upstream_include_dir}/*.orig"
+    )
+    foreach(_orig_header IN LISTS _preserved_headers)
+        get_filename_component(_orig_name "${_orig_header}" NAME)
+        string(REGEX REPLACE "\.orig$" "" _header_name "${_orig_name}")
+        set(_overlay_header "${overlay_include_dir}/${_header_name}")
+        set(_upstream_header "${upstream_include_dir}/${_header_name}")
+        if ((NOT EXISTS "${_overlay_header}") AND (NOT EXISTS "${_upstream_header}"))
+            file(RENAME "${_orig_header}" "${_upstream_header}")
+            message(STATUS "Genesis4 header restored: include/${_header_name}.orig -> include/${_header_name}")
+        endif()
+    endforeach()
 
     file(GLOB _overlay_headers CONFIGURE_DEPENDS
         "${overlay_include_dir}/*.h"
@@ -175,27 +201,12 @@ function(g4_preserve_shadowed_genesis_headers overlay_include_dir upstream_inclu
     endforeach()
 endfunction()
 
-g4_clone_if_missing("AMReX" "${G4_AMREX_REPOSITORY}" "${G4_AMREX_GIT_REF}" "${G4_AMREX_SOURCE_DIR}" "CMakeLists.txt")
-g4_clone_if_missing("Genesis4" "${G4_UPSTREAM_REPOSITORY}" "${G4_UPSTREAM_GIT_REF}" "${G4_UPSTREAM_SOURCE_DIR}" "include/version.h.in")
+git_clone_if_missing("Genesis4" "${G4_UPSTREAM_REPOSITORY}" "${G4_UPSTREAM_GIT_REF}" "${G4_UPSTREAM_SOURCE_DIR}" "include/version.h.in")
 
 # ──────────────────────────────────────────────────────
 # Genesis4 source paths
 # ──────────────────────────────────────────────────────
 set(G4 ${G4_UPSTREAM_SOURCE_DIR})
-g4_preserve_shadowed_genesis_headers("${CMAKE_SOURCE_DIR}/include" "${G4}/include")
-
-# ──────────────────────────────────────────────────────
-# AMReX configuration (must be set BEFORE add_subdirectory)
-# ──────────────────────────────────────────────────────
-set(AMReX_GPU_BACKEND "CUDA" CACHE STRING "GPU backend" FORCE)
-# set(AMReX_CUDA_ARCH "86" CACHE STRING "CUDA architecture (sm_86 = RTX A4000)" FORCE)
-set(AMReX_MPI ON CACHE BOOL "Enable MPI" FORCE)
-set(AMReX_OMP OFF CACHE BOOL "Disable OpenMP" FORCE)
-set(AMReX_PARTICLES ON CACHE BOOL "Enable particles" FORCE)
-set(AMReX_FORTRAN OFF CACHE BOOL "Disable Fortran" FORCE)
-set(AMReX_LINEAR_SOLVERS ON CACHE BOOL "Enable linear solvers" FORCE)
-set(AMReX_PRECISION "DOUBLE" CACHE STRING "Double precision" FORCE)
-add_subdirectory(${G4_AMREX_SOURCE_DIR} ${CMAKE_BINARY_DIR}/AMReX-build)
 
 # ──────────────────────────────────────────────────────
 # Find dependencies
@@ -241,7 +252,9 @@ configure_file(
     @ONLY
 )
 
+# ──────────────────────────────────────────────────────
 # Files reused directly from Genesis4 (no modification)
+# ──────────────────────────────────────────────────────
 set(G4_UNCHANGED_SRC
     # Util
     ${G4}/src/Util/BesselJ.cpp
@@ -264,10 +277,14 @@ set(G4_UNCHANGED_SRC
     ${G4}/src/Core/Undulator.cpp
     ${G4}/src/Core/Incoherent.cpp
     ${G4}/src/Core/Collective.cpp
+    ${G4}/src/Core/Control.cpp
+    ${G4}/src/Core/Diagnostic.cpp
     ${G4}/src/Core/DiagnosticUser.cpp
+    ${G4}/src/Core/BeamSolver.cpp
+    ${G4}/src/Core/TrackBeam.cpp
+    ${G4}/src/Core/FieldSolverADI.cpp
     ${G4}/src/Core/FieldSolverFFT.cpp
     ${G4}/src/Core/EFieldSolver.cpp
-    # ${G4}/src/Core/Diagnostic.cpp
     # IO
     ${G4}/src/IO/HDF5base.cpp
     ${G4}/src/IO/Output.cpp
@@ -302,50 +319,141 @@ set(G4_UNCHANGED_SRC
     ${G4}/src/Main/Setup.cpp
     ${G4}/src/Main/SponRad.cpp
     ${G4}/src/Main/GenTime.cpp
-    ${G4}/src/Main/Track.cpp
+    # ${G4}/src/Main/Track.cpp
     ${G4}/src/Main/Wake.cpp
 )
 
-# AMReX-ported source files (new implementations)
-set(AMREX_PORTED_SRC
-    src/Core/Gencore.cpp
-    src/Core/Beam.cpp
-    src/Core/Field.cpp
-    src/Core/TrackBeam.cpp
-    src/Core/BeamSolver.cpp
-    src/Core/FieldSolverADI.cpp
-    src/Core/Control.cpp
-    src/Core/Diagnostic.cpp
-)
+# ──────────────────────────────────────────────────────
+# Build configuration: AMReX vs plain CPU
+# ──────────────────────────────────────────────────────
+if(GENESIS_USE_AMREX)
+    enable_language(CUDA)
+
+    git_clone_if_missing("AMReX" "${G4_AMREX_REPOSITORY}" "${G4_AMREX_GIT_REF}" "${G4_AMREX_SOURCE_DIR}" "CMakeLists.txt")
+
+
+    # ──────────────────────────────────────────────────────
+    # CUDA architecture selection
+    # ──────────────────────────────────────────────────────
+    set(GENESIS_CUDA_ARCHITECTURES "native" CACHE STRING
+        "CUDA architectures: native, 75 for Quadro RTX 6000, 86 for RTX A4000, 89 for RTX 6000 Ada, 90 for H100")
+
+    set(CMAKE_CUDA_ARCHITECTURES "${GENESIS_CUDA_ARCHITECTURES}" CACHE STRING
+        "CUDA architectures for Genesis4_AMReX")
+
+    # Keep AMReX in sync with this project. Do not FORCE, so users can override it.
+    set(AMReX_CUDA_ARCH "${GENESIS_CUDA_ARCHITECTURES}" CACHE STRING
+        "CUDA architecture for AMReX")
+
+
+    # AMReX configuration (must be set BEFORE add_subdirectory)
+    set(AMReX_GPU_BACKEND "CUDA" CACHE STRING "GPU backend" FORCE)
+    # set(AMReX_CUDA_ARCH "86" CACHE STRING "CUDA architecture (sm_86 = RTX A4000)" FORCE)
+    set(AMReX_MPI ON CACHE BOOL "Enable MPI" FORCE)
+    set(AMReX_OMP OFF CACHE BOOL "Disable OpenMP" FORCE)
+    set(AMReX_PARTICLES ON CACHE BOOL "Enable particles" FORCE)
+    set(AMReX_FORTRAN OFF CACHE BOOL "Disable Fortran" FORCE)
+    set(AMReX_LINEAR_SOLVERS ON CACHE BOOL "Enable linear solvers" FORCE)
+    set(AMReX_PRECISION "DOUBLE" CACHE STRING "Double precision" FORCE)
+    add_subdirectory(${G4_AMREX_SOURCE_DIR} ${CMAKE_BINARY_DIR}/AMReX-build)
+
+    # AMReX-ported source files (new implementations)
+    set(AMREX_PORTED_CUDA_SRC
+        src/Core/TrackBeamCUDA.cpp
+        src/Core/BeamSolverCUDA.cpp
+        src/Core/FieldSolverADICUDA.cpp
+        src/Core/FieldSolverFFTCUDA.cpp
+        src/Core/ControlCUDA.cpp
+        src/Core/DiagnosticCUDA.cpp
+        src/Core/Gencore.cpp
+        src/Core/Beam.cpp
+        src/Core/Field.cpp
+    )
+
+    # Port glue.  CPU solvers are compiled directly from upstream Genesis4 and are
+    # selected when &track/use_cuda is false.
+    set(AMREX_PORTED_CXX_SRC
+        src/Main/Track.cpp
+    )
+
+    g4_preserve_shadowed_headers("${CMAKE_SOURCE_DIR}/include" "${G4}/include")
+
+    find_package(CUDAToolkit REQUIRED)
+
+    add_library(genesis4_amrex STATIC
+        ${G4_UNCHANGED_SRC}
+        ${AMREX_PORTED_CUDA_SRC}
+        ${AMREX_PORTED_CXX_SRC}
+    )
+    set_target_properties(genesis4_amrex PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    # Compile only AMReX/CUDA sources as CUDA.  Upstream CPU solvers are built as
+    # ordinary C++ and selected when Field/Beam use_cuda is false.
+    set_source_files_properties(${AMREX_PORTED_CUDA_SRC} PROPERTIES LANGUAGE CUDA)
+
+    target_include_directories(genesis4_amrex
+        PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${G4}/include
+        ${CMAKE_BINARY_DIR}/include
+    )
+
+    target_link_libraries(genesis4_amrex
+        PUBLIC
+        amrex
+        MPI::MPI_C
+        CUDA::cufft
+    )
+    target_compile_definitions(genesis4_amrex PUBLIC GENESIS_USE_AMREX=1)
+
+else()
+    set(G4_CHANGED_SRC
+        ${G4}/src/Main/Track.cpp
+        ${G4}/src/Core/Gencore.cpp
+        ${G4}/src/Core/Beam.cpp
+        ${G4}/src/Core/Field.cpp
+    )
+    
+    # Plain CPU build: no AMReX, no CUDA, upstream Genesis4 sources only
+    g4_restore_shadowed_headers("${CMAKE_SOURCE_DIR}/include" "${G4}/include")
+
+    add_library(genesis4_amrex STATIC
+        ${G4_UNCHANGED_SRC}
+        ${G4_CHANGED_SRC}
+    )
+
+    target_include_directories(genesis4_amrex
+        PUBLIC
+        ${G4}/include
+        ${CMAKE_BINARY_DIR}/include
+    )
+
+    target_link_libraries(genesis4_amrex
+        PUBLIC
+        MPI::MPI_C
+    )
+endif()
 
 # ──────────────────────────────────────────────────────
-# Build library
+# Optional dependencies
 # ──────────────────────────────────────────────────────
-add_library(genesis4_amrex STATIC
-    ${G4_UNCHANGED_SRC}
-    ${AMREX_PORTED_SRC}
-)
-set_target_properties(genesis4_amrex PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+find_package(PkgConfig REQUIRED)
+set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:$ENV{FFTW_ROOT}/lib/pkgconfig/")
+pkg_check_modules(FFTW QUIET fftw3 IMPORTED_TARGET)
+if (TARGET PkgConfig::FFTW)
+    message(STATUS "FFTW found")
+    list(APPEND _libraries PkgConfig::FFTW)
+    link_libraries(PkgConfig::FFTW)
+else()
+        message(STATUS "FFTW not found")
+        message(STATUS "Excluding FFTW specific source code")
+endif()
 
-# Compile AMReX-ported sources as CUDA (they include AMReX headers)
-set_source_files_properties(${AMREX_PORTED_SRC} PROPERTIES LANGUAGE CUDA)
-# Unchanged Genesis4 sources compile as regular C++ (PIMPL hides AMReX types from headers)
-
-# Include path order: our include/ first (overrides), then Genesis4's, then generated
-target_include_directories(genesis4_amrex
-    PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
-    ${G4}/include
-    ${CMAKE_BINARY_DIR}/include
-)
-
-target_link_libraries(genesis4_amrex
-    PUBLIC
-    amrex
-    MPI::MPI_C
-)
-
-target_compile_definitions(genesis4_amrex PUBLIC GENESIS_USE_AMREX=1)
+# add optional macro definitions
+if (TARGET PkgConfig::FFTW)
+    message(STATUS "Defining the macro FFTW in the source code")
+    target_compile_definitions(genesis4_amrex PRIVATE FFTW=1)
+endif()
 
 if (TARGET HDF5::HDF5)
     target_link_libraries(genesis4_amrex PUBLIC HDF5::HDF5)
@@ -359,5 +467,3 @@ endif()
 # ──────────────────────────────────────────────────────
 add_executable(genesis4 ${G4}/src/Main/mainwrap.cpp)
 target_link_libraries(genesis4 genesis4_amrex)
-
-

@@ -8,6 +8,9 @@
 #include "Particle.h"
 #include "Undulator.h"
 #include "BeamSolver.h"
+#ifdef GENESIS_USE_AMREX
+#include "BeamSolverCUDA.h"
+#endif
 #include "Incoherent.h"
 #include "Sorting.h"
 #include "Collective.h"
@@ -34,6 +37,9 @@ class Beam{
    double getSize(int);
    void track(double, vector<Field *> *, Undulator *);
    void setOutput(bool,bool,bool,bool);
+#ifdef GENESIS_USE_AMREX
+   void setUseCuda(bool);
+#endif
    void setWriteFilter(bool,int,int,int);
    bool get_WriteFilter_active();
    int  get_WriteFilter_from();
@@ -79,6 +85,10 @@ class Beam{
    
  private:
    BeamSolver solver;
+#ifdef GENESIS_USE_AMREX
+   BeamSolverCUDA cuda_solver;
+   bool useCudaSolver_;
+#endif
    Incoherent incoherent;
    Collective col;
    Sorting sorting;
@@ -96,6 +106,12 @@ class Beam{
 
 // check allocated memory
 inline void Beam::checkBeforeTracking() {
+#ifdef GENESIS_USE_AMREX
+    if (useCudaSolver_) {
+        cuda_solver.checkAllocation(this->beam.size());
+        return;
+    }
+#endif
     solver.checkAllocation(this->beam.size());
 }
 
@@ -111,6 +127,9 @@ inline void Beam::initIncoherent(int base, int rank, bool spread, bool loss){
 
 inline void Beam::initEField(double rmax, int ngrid, int nz, int nphi, double lambda, bool lngr){
   solver.initEField(rmax,ngrid,nz,nphi,lambda,lngr);
+#ifdef GENESIS_USE_AMREX
+  cuda_solver.initEField(rmax,ngrid,nz,nphi,lambda,lngr);
+#endif
 }
 
 inline void Beam::initWake(unsigned int ns, unsigned int nsNode, double ds, double *wakeext, double *wakeres, double *wakegeo,double *wakerou, double ztrans, double radius, bool transient){
@@ -118,7 +137,16 @@ inline void Beam::initWake(unsigned int ns, unsigned int nsNode, double ds, doub
 }
 
 inline bool Beam::hasWake(){return col.hasWakeDefined();}
-inline double Beam::getSCField(int islice) {return solver.getSCField(islice);}
+inline double Beam::getSCField(int islice) {
+#ifdef GENESIS_USE_AMREX
+  if (useCudaSolver_) { return cuda_solver.getSCField(islice); }
+#endif
+  return solver.getSCField(islice);
+}
+
+#ifdef GENESIS_USE_AMREX
+inline void Beam::setUseCuda(bool in) { useCudaSolver_ = in; }
+#endif
 
 inline void Beam::setBunchingHarmonicOutput(int harm_in){bharm=harm_in;}
 inline int Beam::getBunchingHarmonics(){return bharm;}

@@ -7,6 +7,10 @@
 #include "Field.h"
 #include "FieldSolverADI.h"
 #include "FieldSolverFFT.h"
+#ifdef GENESIS_USE_AMREX
+#include "FieldSolverADICUDA.h"
+#include "FieldSolverFFTCUDA.h"
+#endif
 #include <fstream>
 
 
@@ -81,10 +85,22 @@ void Field::init(int nsize, int ngrid_in, double dgrid_in, double xlambda0, doub
   solver  = new FieldSolverADI;
 }
 
-void Field::initSolver(bool isFFT,bool filter, double xc, double yc, double sig) {
+void Field::initSolver(bool isFFT,bool filter, double xc, double yc, double sig, bool use_cuda) {
     if (hasSolver_) {
         delete solver;
     }
+#ifdef GENESIS_USE_AMREX
+    if (use_cuda) {
+        if (isFFT) {
+            solver = new FieldSolverFFTCUDA;
+            solver->initSourceFilter(xc,yc,sig,filter);
+        } else {
+            solver = new FieldSolverADICUDA;
+        }
+        hasSolver_=true;
+        return;
+    }
+#endif
     if (isFFT) {
         solver = new FieldSolverFFT;
         solver->initSourceFilter(xc,yc,sig,filter);
